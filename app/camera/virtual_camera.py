@@ -303,12 +303,6 @@ class VirtualCamera:
         self.position_history.append(np.array([smooth_x, smooth_y]))
         self.velocity_history.append(self.velocity.copy())
         
-        # Disable dynamic zoom for tight, fixed zoom on ball
-        # dynamic_zoom = self._compute_dynamic_zoom(velocity_magnitude, curvature)
-        # if abs(dynamic_zoom - self.zoom_padding) > 0.05:
-        #     self.set_zoom(dynamic_zoom)
-        #     self.stats['zoom_adjustments'] += 1
-        
         crop = self._calculate_crop(smooth_x, smooth_y)
         
         if self.frame_count % 100 == 0:
@@ -318,17 +312,6 @@ class VirtualCamera:
                         f"vel_mag={velocity_magnitude:.2f}")
         
         return crop
-    
-    def _compute_dynamic_zoom(self, velocity_magnitude: float, curvature: float) -> float:
-        base_zoom = self.zoom_padding
-        
-        velocity_factor = min(velocity_magnitude / 200.0, 0.3)
-        curvature_factor = min(curvature * 10.0, 0.2)
-        
-        dynamic_zoom = base_zoom * (1.0 + velocity_factor + curvature_factor)
-        dynamic_zoom = np.clip(dynamic_zoom, 1.0, 2.0)
-        
-        return dynamic_zoom
     
     def _calculate_crop(self, center_x: float, center_y: float) -> Tuple[int, int, int, int]:
         half_w = self.effective_width / 2

@@ -195,16 +195,6 @@ def main():
     # Initialize tracker with optimized parameters for ball tracking
     logger.info("[3/5] Initializing ball tracker...")
     tracking_config = config.get('tracking', {})
-    tracker = BallTracker(
-        max_lost_frames=tracking_config.get('max_lost_frames', 10),
-        min_confidence=tracking_config.get('min_confidence', 0.45),
-        iou_threshold=tracking_config.get('iou_threshold', 0.10),
-        adaptive_noise=True,
-        allow_chaos_mode=tracking_config.get('allow_chaos_mode', False),
-        allow_jitter_mode=tracking_config.get('allow_jitter_mode', False),
-        detection_smoothing=tracking_config.get('detection_smoothing', 0.25)
-    )
-    print(f"   → Tracker config: max_lost={tracker.max_lost_frames}, min_conf={tracker.min_confidence:.2f}, iou={tracker.iou_threshold:.2f}")
     
     # Start MJPEG server
     mjpeg_port = config.get('stream', {}).get('mjpeg_port', 8554)
@@ -247,6 +237,7 @@ def main():
     # Use source FPS if available, otherwise default to 30
     source_fps = getattr(reader, 'fps', 30.0)
     logger.info(f"Source FPS: {source_fps:.2f}")
+
     tracker = BallTracker(
         frame_width=reader.width,
         frame_height=reader.height,
@@ -256,7 +247,14 @@ def main():
         adaptive_noise=True,
         allow_chaos_mode=tracking_config.get('allow_chaos_mode', False),
         allow_jitter_mode=tracking_config.get('allow_jitter_mode', False),
-        detection_smoothing=tracking_config.get('detection_smoothing', 0.25)
+        detection_smoothing=tracking_config.get('detection_smoothing', 0.25),
+        vertical_jump_limit_factor=tracking_config.get('vertical_jump_limit_factor', 0.14),
+        jump_threshold_factor=tracking_config.get('jump_threshold_factor', 0.13),
+        jitter_min_factor=tracking_config.get('jitter_min_factor', 0.008),
+        jitter_max_factor=tracking_config.get('jitter_max_factor', 0.031),
+        large_jump_factor=tracking_config.get('large_jump_factor', 0.0625),
+        erratic_variance_factor=tracking_config.get('erratic_variance_factor', 0.012),
+        erratic_mean_factor=tracking_config.get('erratic_mean_factor', 0.036)
     )
     logger.info(f"   → Tracker config: max_lost={tracker.max_lost_frames}, min_conf={tracker.min_confidence:.2f}, iou={tracker.iou_threshold:.2f}")
 
@@ -308,11 +306,12 @@ def main():
     crop_coords = (0, 0, reader.width, reader.height)
     
     # Fast zoom system
+    zoom_config = config.get('zoom_control', {})
     current_zoom_level = 1.0
     target_zoom_level = 1.0
-    max_zoom_level = 1.8
+    max_zoom_level = zoom_config.get('max_zoom_level', 1.8)
     frames_tracking = 0
-    frames_required_for_zoom = 4
+    frames_required_for_zoom = zoom_config.get('frames_required_for_zoom', 4)
     lost_search_center = None  # Gradual expansion center when lost
     
     # Loop detection and recovery
@@ -323,7 +322,17 @@ def main():
     consecutive_det_frames = 0  # consecutive frames with detection
     target_zoom_before_loss = 1.0
 
-    zoom = SmoothZoom(min_zoom=1.0, max_zoom=max_zoom_level, stiffness=0.060, damping=0.60, max_rate=0.11, max_rate_in=0.14, max_rate_out=0.10, accel_limit=0.05)
+    zoom = SmoothZoom(
+        min_zoom=1.0,
+        max_zoom=max_zoom_level,
+        stiffness=zoom_config.get('stiffness', 0.060),
+        damping=zoom_config.get('damping', 0.60),
+        max_rate=zoom_config.get('max_rate', 0.11),
+        max_rate_in=zoom_config.get('max_rate_in', 0.14),
+        max_rate_out=zoom_config.get('max_rate_out', 0.10),
+        accel_limit=zoom_config.get('accel_limit', 0.05)
+    )
+
     diag = int(math.hypot(reader.width, reader.height))
     stable_step_px = max(6, int(diag * 0.030))
     jump_reset_px = max(36, int(diag * 0.050))
@@ -565,7 +574,9 @@ def main():
                     roi_fail_count = 0
                     roi_stable_frames = 0
                     roi_last_valid_pos = None
+                    frames_tracking = 0
                 else:
+                    frames_tracking += 1
                     roi_stable_frames += 1
                     if (not roi_active) and roi_stable_frames >= roi_ready_frames:
                         # ROI disabled per user request for stability

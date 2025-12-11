@@ -2,8 +2,6 @@ import numpy as np
 import logging
 from typing import Optional, Tuple, List, Dict
 from collections import deque
-from scipy.optimize import linear_sum_assignment
-from scipy.stats import chi2
 from app.camera.one_euro_filter import OneEuroFilter
 
 logger = logging.getLogger(__name__)
@@ -135,7 +133,14 @@ class BallTracker:
         adaptive_noise: bool = True,
         allow_chaos_mode: bool = False,
         allow_jitter_mode: bool = False,
-        detection_smoothing: float = 0.25
+        detection_smoothing: float = 0.25,
+        vertical_jump_limit_factor: float = 0.14,
+        jump_threshold_factor: float = 0.13,
+        jitter_min_factor: float = 0.008,
+        jitter_max_factor: float = 0.031,
+        large_jump_factor: float = 0.0625,
+        erratic_variance_factor: float = 0.012,
+        erratic_mean_factor: float = 0.036
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
@@ -148,9 +153,16 @@ class BallTracker:
         self.allow_jitter_mode = allow_jitter_mode
         self.detection_smoothing = max(0.0, min(1.0, float(detection_smoothing)))
         
+        # Configuration parameters
+        self.vertical_jump_limit_factor = vertical_jump_limit_factor
+        self.jump_threshold_factor = jump_threshold_factor
+        self.jitter_min_factor = jitter_min_factor
+        self.jitter_max_factor = jitter_max_factor
+        self.large_jump_factor = large_jump_factor
+        self.erratic_variance_factor = erratic_variance_factor
+        self.erratic_mean_factor = erratic_mean_factor
+
         # Initialize One Euro Filter for robust smoothing
-        # min_cutoff=0.1 (slow movement -> heavy smoothing)
-        # beta=0.05 (fast movement -> low latency)
         self.one_euro = OneEuroFilter(freq=30.0, min_cutoff=0.1, beta=0.05, d_cutoff=1.0)
         
         self.kalman = ExtendedKalmanFilter(dt=dt, process_noise=0.01, measurement_noise=5.0)
@@ -273,16 +285,14 @@ class BallTracker:
                 # Track all jumps for pattern detection
                 self.recent_jumps.append(jump_dist)
                 
-                # Track small movements for jitter detection (movements between 0.8% and 3.1% of width)
-                # 15px is ~0.8% of 1920, 60px is ~3.1% of 1920
-                min_jitter = self.frame_width * 0.008
-                max_jitter = self.frame_width * 0.031
+                # Track small movements for jitter detection
+                min_jitter = self.frame_width * self.jitter_min_factor
+                max_jitter = self.frame_width * self.jitter_max_factor
                 if min_jitter < jump_dist < max_jitter:
                     self.small_movements.append(jump_dist)
                 
-                # Count large jumps in recent history (>6.25% width is considered large)
-                # 120px is 6.25% of 1920
-                large_jump_thresh = self.frame_width * 0.0625
+                # Count large jumps in recent history
+                large_jump_thresh = self.frame_width * self.large_jump_factor
                 large_jumps = sum(1 for j in self.recent_jumps if j > large_jump_thresh)
                 
                 # Detect jitter: many small consecutive movements
@@ -294,10 +304,11 @@ class BallTracker:
                 
                 # Very permissive jump thresholds
                 if is_stable:
-                    # 250px is ~13% of 1920
-                    jump_threshold = self.frame_width * 0.13
+                    # ~13% of width
+                    jump_threshold = self.frame_width * self.jump_threshold_factor
                 else:
-                    jump_threshold = self.frame_width * 0.166               
+                    jump_threshold = self.frame_width * (self.jump_threshold_factor * 1.28) # approx 0.166/0.13
+
                 should_activate_chaos = False
                 if self.allow_chaos_mode and self.chaos_activation_cooldown == 0:
                     if jump_dist > jump_threshold:
@@ -315,15 +326,14 @@ class BallTracker:
                     detection = None
                 
                 # More permissive during chaos mode
-                # 150px is ~7.8% of 1920
-                chaos_jump_limit = self.frame_width * 0.078
+                # ~7.8% of width (0.6 of 0.13 is 0.078)
+                chaos_jump_limit = self.frame_width * (self.jump_threshold_factor * 0.6)
                 if self.allow_chaos_mode and self.chaos_mode and jump_dist > chaos_jump_limit:
                     detection = None
                 
                 # During jitter mode, reject detections that cause small movements
                 # This stabilizes the camera during tremors
-                # 65px is ~3.4% of 1920
-                jitter_limit_high = self.frame_width * 0.034
+                jitter_limit_high = self.frame_width * (self.jitter_max_factor * 1.1)
                 if self.allow_jitter_mode and self.jitter_mode and min_jitter < jump_dist < jitter_limit_high:
                     logger.debug(f"Jitter mode: suppressing small movement {jump_dist:.1f}px")
                     detection = None
@@ -331,7 +341,7 @@ class BallTracker:
             if detection is not None and self.stability_lock > 0 and self.kalman.initialized:
                 pred_x, pred_y = float(self.kalman.x[0, 0]), float(self.kalman.x[1, 0])
                 dist_to_pred = float(np.sqrt((x_center - pred_x)**2 + (y_center - pred_y)**2))
-                # 80px is ~4.1% of 1920
+                # ~4.1% of width
                 lock_threshold = self.frame_width * 0.041
                 
                 if dist_to_pred > lock_threshold:
@@ -346,15 +356,11 @@ class BallTracker:
                     detection = None
             
             # Vertical Jump Guard: Reject sudden large upward movements
-            
-            # Vertical Jump Guard: Reject sudden large upward movements
-            # This is common when a player passes in front and the model detects their head/shoulder
             if detection is not None and self.last_accepted_position is not None:
                 last_y = self.last_accepted_position[1]
                 # If new y is significantly higher (smaller value) than last y
-                # 150px is ~7.8% of 1080p height
                 vertical_jump = last_y - y_center
-                vertical_limit = self.frame_height * 0.14  # ~150px
+                vertical_limit = self.frame_height * self.vertical_jump_limit_factor
                 
                 if vertical_jump > vertical_limit and not self.chaos_mode:
                     # Only reject if we don't have super high confidence
@@ -398,14 +404,14 @@ class BallTracker:
                 vx_est, vy_est = self.get_velocity()
                 vmag = float(np.sqrt(vx_est**2 + vy_est**2))
                 
-                # 100px is ~5.2% of 1920
+                # 5.2% of width
                 base_distance = self.frame_width * 0.052
-                # 600px is ~31% of 1920
+                # 31% of width
                 velocity_factor = min(vmag * 2.0, self.frame_width * 0.31)
-                # 200px is ~10.4% of 1920
+                # 10.4% of width
                 lost_relaxation = min(self.lost_frames * (self.frame_width * 0.026), self.frame_width * 0.104)
-                # 120px is ~6.25% of 1920
-                erratic_penalty = (self.frame_width * 0.0625) if detector_erratic else 0.0
+                # 6.25% of width
+                erratic_penalty = (self.frame_width * self.large_jump_factor) if detector_erratic else 0.0
                 allowed_distance = base_distance + velocity_factor + lost_relaxation - erratic_penalty
                 
                 dist_curr = float(np.sqrt((x_center - float(self.kalman.x[0,0]))**2 + (y_center - float(self.kalman.x[1,0]))**2))
@@ -624,19 +630,18 @@ class BallTracker:
         variance = np.var(recent_movements)
         mean_movement = np.mean(recent_movements)
         
-        # 600.0 variance is roughly (24.5px)^2. 24.5px is ~1.2% of 1920.
-        # So variance threshold ~ (width * 0.012)^2
-        var_thresh = (self.frame_width * 0.012) ** 2
+        # Variance threshold ~ (width * erratic_variance_factor)^2
+        var_thresh = (self.frame_width * self.erratic_variance_factor) ** 2
         if variance > var_thresh:
             return True
         
-        # 70.0 is ~3.6% of 1920. 350.0 is (18.7px)^2. 18.7px is ~0.97% of 1920.
-        mean_thresh = self.frame_width * 0.036
-        var_thresh_2 = (self.frame_width * 0.0097) ** 2
+        mean_thresh = self.frame_width * self.erratic_mean_factor
+        # ~0.97% of width (roughly 1/4 of mean factor squared)
+        var_thresh_2 = (self.frame_width * (self.erratic_mean_factor * 0.27)) ** 2
         if mean_movement > mean_thresh and variance > var_thresh_2:
             return True
         
-        # 85.0 is ~4.4% of 1920
+        # 4.4% of width
         jump_thresh = self.frame_width * 0.044
         consecutive_large_jumps = sum(1 for m in recent_movements[-5:] if m > jump_thresh)
         if consecutive_large_jumps >= 3:

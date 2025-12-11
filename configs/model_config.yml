@@ -14,3 +14,12 @@ tracking:
   min_confidence: 0.50
   iou_threshold: 0.15
   history_size: 30
+
+  # Advanced Tracking Parameters (Factors of frame width/height)
+  vertical_jump_limit_factor: 0.14
+  jump_threshold_factor: 0.13
+  jitter_min_factor: 0.008
+  jitter_max_factor: 0.031
+  large_jump_factor: 0.0625
+  erratic_variance_factor: 0.012
+  erratic_mean_factor: 0.036
